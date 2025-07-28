@@ -354,9 +354,18 @@ suppressMessages({
 
 # 10 ── COMBINE, WRITE, RENDER PDF ------------------------------------------
 make_md_links <- \(txt) {
-  pattern <- "(?<!\\]\\()https?://\\S+"          # only raw URLs
-  str_replace_all(txt, pattern, "[Link](\\0)")
+  # 1⃣  If GPT already wrote “[Link] …URL…”, merge them into one link.
+  txt <- stringr::str_replace_all(
+    txt,
+    "\\[Link\\]\\s+(https?://\\S+)",
+    "[Link](\\1)"
+  )
+
+  # 2⃣  Now catch any *remaining* bare URLs (not already inside a link).
+  pattern <- "(?<!\\]\\()https?://\\S+"   # negative‑look‑behind = skip links
+  stringr::str_replace_all(txt, pattern, "[Link](\\0)")
 }
+
 
 final_report <- glue(
   "{overall_summary}\n\n{overall_summary2}\n\n{overall_summary3}\n\n",
