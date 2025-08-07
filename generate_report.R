@@ -353,18 +353,23 @@ suppressMessages({
 })
 
 # 10 ── COMBINE, WRITE, RENDER PDF ------------------------------------------
-make_md_links <- \(txt) {
-  # 1⃣  If GPT already wrote “[Link] …URL…”, merge them into one link.
+make_md_links <- function(txt) {
+  # 1️⃣ If GPT already wrote "[Link] https://…", merge them.
   txt <- stringr::str_replace_all(
     txt,
     "\\[Link\\]\\s+(https?://\\S+)",
-    "[Link](\\1)"
+    "<a href=\"\\1\">\\1</a>"
   )
 
-  # 2⃣  Now catch any *remaining* bare URLs (not already inside a link).
-  pattern <- "(?<!\\]\\()https?://\\S+"   # negative‑look‑behind = skip links
-  stringr::str_replace_all(txt, pattern, "[Link](\\0)")
+  # 2️⃣ Convert any remaining bare URLs (not already inside () ) to anchors.
+  pattern <- "(?<!\\]\\()https?://\\S+"           # skip things already in []()
+  stringr::str_replace_all(
+    txt,
+    pattern,
+    function(m) sprintf("<a href=\"%s\">%s</a>", m, m)
+  )
 }
+
 
 
 final_report <- glue(
@@ -374,13 +379,36 @@ final_report <- glue(
   str_replace_all("\\$", "\\\\$") |>
   make_md_links()
 
-writeLines(c("# Monthly Summary", "", final_report), "summary.md")
+writeLines(c(
+  "<style>",
+  "  a, a:visited { color:#1a0dab !important; text-decoration:underline; }",
+  "</style>",
+  "",
+  "# Monthly Summary",
+  "",
+  final_report           # contains fully-formed <a href="…">…</a>
+), "summary.md")
 
-pagedown::chrome_print(
+# Markdown → HTML (no autolink)
+html_file <- tempfile(fileext = ".html")
+
+rmarkdown::pandoc_convert(
   "summary.md",
-  output     = "summary_full.pdf",
+  to     = "html4",
+  from   = "markdown+tex_math_single_backslash",   # ← extension removed
+  output = html_file,
+  options = c("--standalone","--section-divs","--embed-resources",
+              "--variable","bs3=TRUE","--variable","theme=bootstrap")
+)
+
+# HTML → PDF
+pagedown::chrome_print(
+  input   = html_file,          # use the HTML you just made
+  output  = "summary_full.pdf",
+  browser = chrome,
   extra_args = "--no-sandbox"
 )
+
 
 # 11 ── UPLOAD TO SUPABASE ---------------------------------------------------
 object_path <- sprintf(
@@ -450,3 +478,4 @@ if (resp_status(mj_resp) >= 300) {
 } else {
   cat("📧  Mailjet response OK — report emailed\n")
 }
+
