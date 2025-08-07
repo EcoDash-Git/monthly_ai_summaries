@@ -276,13 +276,12 @@ Each line in **Data A** has `YYYY-MM-DD HH:MM | ER=% | tweet_text`.
 overall_summary2 <- ask_gpt(prompt2, max_tokens = 1200)
 
 # 7 ── THEMES BY ENGAGEMENT TIER --------------------------------------------
+# 7 ── THEMES BY ENGAGEMENT TIER --------------------------------------------
 df_tier <- df |>
   mutate(
-    tier = cut(
-      engagement_rate,
-      breaks = quantile(engagement_rate, c(0,.33,.66,1), na.rm = TRUE),
-      labels = c("Low","Medium","High"), include.lowest = TRUE
-    )
+    tier_num = dplyr::ntile(engagement_rate, 3),             # 1,2,3
+    tier     = factor(c("Low","Medium","High")[tier_num],
+                      levels = c("Low","Medium","High"))
   )
 
 tidy_tokens <- bind_rows(
@@ -478,4 +477,5 @@ if (resp_status(mj_resp) >= 300) {
 } else {
   cat("📧  Mailjet response OK — report emailed\n")
 }
+
 
