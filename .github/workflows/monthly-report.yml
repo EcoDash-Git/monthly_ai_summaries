@@ -2,20 +2,15 @@
 name: Monthly Twitter Report
 
 on:
-  # Manual trigger from the Actions tab
   workflow_dispatch:
-
-  # At 03:00 UTC on the first day of every month
+  # At 03:00 UTC on the first day of every month
   schedule:
-    - cron: "0 3 1 * *"          # min hr dom mon dow
+    - cron: "0 3 1 * *"
 
 jobs:
   build-run:
     runs-on: ubuntu-latest
 
-    # ------------------------------------------------------------------
-    # Environment variables – pulled from GitHub Secrets / Org Vars
-    # ------------------------------------------------------------------
     env:
       # ---------- Supabase ----------
       SUPABASE_HOST:         ${{ secrets.SUPABASE_HOST }}
@@ -37,35 +32,36 @@ jobs:
       MAIL_TO:               ${{ vars.MAIL_TO }}
 
       CI: true
-      R_KEEP_PKG_SOURCE: no   # make installs non‑interactive
+      R_KEEP_PKG_SOURCE: no
 
     steps:
-      # 1. Checkout repository ------------------------------------------------
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      # 2. Set up R (Posit RSPM binary cache) ---------------------------------
       - name: Set up R
         uses: r-lib/actions/setup-r@v2
         with:
           use-public-rspm: true
 
-      # 3. Set up Pandoc (pagedown needs it) ----------------------------------
       - name: Set up Pandoc
         uses: r-lib/actions/setup-pandoc@v2
 
-      # 4. Install a headless Google Chrome -----------------------------------
+      # Install Chrome and capture its path
       - name: Install headless Chrome
+        id: setup-chrome
         uses: browser-actions/setup-chrome@v2
         with:
           install-dependencies: true
           chrome-version: stable
 
-      # 4 bis. Expose Chrome path to chromote / pagedown ----------------------
-      - name: Export CHROMOTE_CHROME for pagedown
-        run: echo "CHROMOTE_CHROME=$CHROME_BIN" >> $GITHUB_ENV
+      # Expose Chrome path to the rest of the job
+      - name: Export CHROME_BIN
+        run: echo "CHROME_BIN=${{ steps.setup-chrome.outputs.chrome-path }}" >> $GITHUB_ENV
 
-      # 5. Extra system libraries Chrome + some R pkgs need -------------------
+      # Optional: also set CHROMOTE_CHROME (some setups look for this)
+      - name: Export CHROMOTE_CHROME
+        run: echo "CHROMOTE_CHROME=${{ steps.setup-chrome.outputs.chrome-path }}" >> $GITHUB_ENV
+
       - name: Install system libraries
         run: |
           sudo apt-get update -y
@@ -73,9 +69,8 @@ jobs:
             libcurl4-openssl-dev libssl-dev libxml2-dev \
             libfontconfig1 libharfbuzz-dev libfribidi-dev \
             libfreetype6-dev libpng-dev libtiff5-dev libjpeg-dev \
-            libnss3 libxss1      # ← keeps Chrome from crashing
+            libnss3 libxss1
 
-      # 6. Install R package dependencies (uses binaries) ---------------------
       - name: Install R package dependencies
         uses: r-lib/actions/setup-r-dependencies@v2
         with:
@@ -91,18 +86,17 @@ jobs:
             any::DBI
             any::base64enc
             any::tidytext
+            any::magrittr
 
-      # 7. Confirm Chrome path (debug helper) ---------------------------------
       - name: Confirm Chrome path (debug)
         run: |
           echo "CHROME_BIN -> $CHROME_BIN"
+          "$CHROME_BIN" --version || true
           Rscript -e 'cat("pagedown::find_chrome() ->", pagedown::find_chrome(), "\n")'
 
-      # 8. Run the report‑generation script -----------------------------------
       - name: Run report script
         run: Rscript generate_report.R
 
-      # 9. Upload artefacts even on failure (helps debugging) -----------------
       - name: Upload generated artefacts (always)
         if: always()
         uses: actions/upload-artifact@v4
@@ -112,4 +106,3 @@ jobs:
             summary.md
             summary_full.pdf
           if-no-files-found: warn
-
