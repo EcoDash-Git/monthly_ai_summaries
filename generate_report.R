@@ -1,13 +1,13 @@
 #!/usr/bin/env Rscript
 # ---------------------------------------------------------------------------
-# generate_report.R – Scrape, summarise, render PDF, upload to Supabase,
-#                     and email the report through Mailjet
+# generate_report.R – Monthly summary: render PDF, upload to Supabase,
+#                     and email via Mailjet
 # ---------------------------------------------------------------------------
 
 # 0 ── PACKAGES ──────────────────────────────────────────────────────────────
 required <- c(
   "tidyverse", "lubridate", "httr2", "httr", "jsonlite", "glue", "pagedown",
-  "RPostgres", "DBI", "base64enc", "tidytext"
+  "RPostgres", "DBI", "base64enc", "tidytext", "magrittr"
 )
 invisible(lapply(required, \(pkg) {
   if (!requireNamespace(pkg, quietly = TRUE)) install.packages(pkg, quiet = TRUE)
@@ -22,7 +22,6 @@ trim_env <- \(var, default = "") {
 
 ask_gpt <- function(prompt, model = "gpt-4o-mini",
                     temperature = 0, max_tokens = 700, retries = 3) {
-  
   for (k in seq_len(retries)) {
     resp <- tryCatch(
       request("https://api.openai.com/v1/chat/completions") |>
@@ -44,7 +43,7 @@ ask_gpt <- function(prompt, model = "gpt-4o-mini",
         req_perform(),
       error = identity
     )
-    
+
     if (!inherits(resp, "error") && resp_status(resp) == 200) {
       return(
         resp_body_json(resp)$choices[[1]]$message$content |>
@@ -56,15 +55,15 @@ ask_gpt <- function(prompt, model = "gpt-4o-mini",
   stop("All OpenAI retries failed")
 }
 
-`%||%` <- function(a, b) if (nzchar(a)) a else b     # tiny helper
+`%||%` <- function(a, b) if (nzchar(a)) a else b
 
-# 2 ── ENVIRONMENT VARIABLES -------------------------------------------------
+# 2 ── ENV VARS ──────────────────────────────────────────────────────────────
 SB_HOST        <- trim_env("SUPABASE_HOST")
 SB_PORT        <- as.integer(trim_env("SUPABASE_PORT", "6543"))
 SB_DB          <- trim_env("SUPABASE_DB")
 SB_USER        <- trim_env("SUPABASE_USER")
 SB_PWD         <- trim_env("SUPABASE_PWD")
-SB_URL         <- trim_env("SUPABASE_URL")          # https://<ref>.supabase.co
+SB_URL         <- trim_env("SUPABASE_URL")
 SB_STORAGE_KEY <- trim_env("SUPABASE_SERVICE_ROLE")
 SB_BUCKET      <- trim_env("SB_BUCKET", "monthly-reports")
 
@@ -72,8 +71,8 @@ OPENAI_KEY     <- trim_env("OPENAI_API_KEY")
 
 MJ_API_KEY     <- trim_env("MJ_API_KEY")
 MJ_API_SECRET  <- trim_env("MJ_API_SECRET")
-MAIL_FROM      <- trim_env("MAIL_FROM")             # "José Peña <jgpena@uc.cl>" or bare address
-MAIL_TO        <- trim_env("MAIL_TO")               # "ecotools@arweave.org.com"
+MAIL_FROM      <- trim_env("MAIL_FROM")
+MAIL_TO        <- trim_env("MAIL_TO")
 
 stopifnot(
   SB_HOST  != "", OPENAI_KEY != "",
@@ -81,7 +80,7 @@ stopifnot(
   MAIL_FROM != "", MAIL_TO != ""
 )
 
-# 3 ── LOAD DATA FROM SUPABASE ----------------------------------------------
+# 3 ── LOAD DATA ─────────────────────────────────────────────────────────────
 con <- DBI::dbConnect(
   RPostgres::Postgres(),
   host     = SB_HOST,
@@ -94,7 +93,6 @@ con <- DBI::dbConnect(
 
 twitter_raw <- DBI::dbReadTable(con, "twitter_raw") |> as_tibble()
 
-# ── UPDATED: full list of account → canonical‑ID mappings ───────────────────
 main_ids <- tibble::tribble(
   ~username,            ~main_id,
   "weave_db",           "1206153294680403968",
@@ -137,57 +135,74 @@ main_ids <- tibble::tribble(
   "ArweaveEco",         "892752981736779776"
 )
 
+# 4 ── PRE-PROCESS ───────────────────────────────────────────────────────────
+start_month <- lubridate::floor_date(Sys.time(), "month")
+end_month   <- lubridate::ceiling_date(Sys.time(), "month")
 
-# 4 ── PRE‑PROCESS TWEETS ----------------------------------------------------
 tweets <- twitter_raw |>
   left_join(main_ids, by = "username") |>
   mutate(
     is_rt_text = str_detect(text, "^RT @"),
     tweet_type = case_when(
-      is_rt_text                                   ~ "retweet",
+      is_rt_text                                                      ~ "retweet",
       user_id == main_id & !is_rt_text & str_detect(text, "https://t.co") ~ "quote",
-      user_id == main_id                           ~ "original",
-      TRUE                                         ~ "other"
+      user_id == main_id                                              ~ "original",
+      TRUE                                                            ~ "other"
     ),
     publish_dt = lubridate::ymd_hms(date, tz = "UTC"),
     text       = str_squish(text)
   ) |>
-  filter(
-    publish_dt >= lubridate::floor_date(Sys.time(), "month"),
-    publish_dt <  lubridate::ceiling_date(Sys.time(), "month")
-  ) |>
+  filter(publish_dt >= start_month, publish_dt < end_month) |>
   distinct(tweet_id, .keep_all = TRUE)
 
-df  <- tweets |> filter(tweet_type == "original")
-df2 <- tweets                                 # full set
+# include quotes like the weekly version (change to "original" only if you prefer)
+df  <- tweets |> filter(tweet_type %in% c("original","quote"))
+df2 <- tweets
 
-# 5 ── SECTION 1 – LAUNCH / ACTIVITY SUMMARY ---------------------------------
+# 5 ── SECTION 1 – ACTIVITY/LAUNCH SUMMARY ──────────────────────────────────
 tweet_lines <- df |>
-  mutate(line = glue(
-    "{format(publish_dt, '%Y-%m-%d %H:%M')} | ",
-    "ER={round(engagement_rate, 4)}% | ",
-    "{str_replace_all(str_trunc(text, 200), '\\n', ' ')} | ",
-    "{tweet_url}"
-  )) |>
+  mutate(
+    line = glue(
+      "{format(publish_dt, '%Y-%m-%d %H:%M')} | ",
+      "@{username} | ",
+      "ER={round(engagement_rate, 4)}% | ",
+      "{str_replace_all(str_trunc(text, 200), '\\n', ' ')} | ",
+      "{tweet_url}"
+    )
+  ) |>
   pull(line)
 
 big_text <- paste(tweet_lines, collapse = "\n")
 
 prompt1 <- glue(
-  "Below is a collection of tweets; each line is ",
-  "URL | Date | Engagement Rate | Tweet text.\n\n",
-  "Write ONE concise bullet‑point summary of all concrete activities, events, ",
-  "and product launches mentioned across the entire set.\n",
-  "• **Headline** (≤20 words) plus the tweet’s date (YYYY‑MM‑DD).\n",
-  "• Next line (indented two spaces) – copy the first 60 characters of the tweet ",
-  "text exactly **and then paste the raw URL**. **Do *not* wrap the URL in brackets ",
-  "or add the word “Link”.**\n\n",
+  "Below is a collection of tweets; each line is\n",
+  "Date | Account | Engagement Rate | Tweet text | URL.\n\n",
+  "Write 5–12 bullet points, ONE PER DISTINCT activity/event/launch.\n",
+  "Format exactly: `YYYY-MM-DD (@account): <≤20 words> (<raw URL>)`.\n",
+  "Keep each bullet on ONE line. Don’t invent details. No extra commentary.\n\n",
   big_text
 )
 
-overall_summary <- ask_gpt(prompt1)
+raw <- ask_gpt(prompt1, max_tokens = 900)
 
-# 6 ── SECTION 2 – NUMERIC INSIGHTS, CONTENT TYPE, HASHTAGS ------------------
+clean_gpt_output <- function(txt) {
+  txt <- gsub("\\((https?://[^)\\s]+)\\s*\\(\\1\\)\\)", "(\\1)", txt, perl = TRUE)
+  keep <- function(l) {
+    l <- trimws(l)
+    !(l == "" || grepl("^https?://", l) || grepl("^\\(", l))
+  }
+  lines <- strsplit(txt, "\n", fixed = TRUE)[[1]]
+  paste(lines[vapply(lines, keep, logical(1))], collapse = "\n")
+}
+
+launches_summary <- raw %>%
+  clean_gpt_output() %>%
+  gsub("<(https?://[^>\\s]+)>", "\\1", ., perl = TRUE) %>%        # drop angle brackets
+  gsub("(?<!\\))\\s(https?://[^\\s)]+)\\s*$", " (\\1)", ., perl = TRUE)  # wrap bare URL once at EOL
+
+overall_summary <- launches_summary
+
+# 6 ── SECTION 2 – NUMERIC INSIGHTS / CONTENT TYPE / HASHTAGS ───────────────
 content_tbl <- df2 |>
   mutate(post_type = tweet_type |> str_to_title()) |>
   group_by(post_type) |>
@@ -218,8 +233,7 @@ hashtag_block <- df2 |>
   pull(row) |>
   glue_collapse(sep = "\n")
 
-num_cols <- c("like_count","retweet_count","reply_count",
-              "view_count","engagement_rate")
+num_cols <- c("like_count","retweet_count","reply_count","view_count","engagement_rate")
 
 five_num <- df |>
   summarise(across(all_of(num_cols), \(x){
@@ -242,46 +256,44 @@ day_time <- df |>
 
 prompt2 <- glue(
   "
-You are an experienced social‑media analyst.
+You are an experienced social-media analyst.
 
-Each line in **Data A** has `YYYY-MM-DD HH:MM | ER=% | tweet_text`.
+Each line in **Data A** has `YYYY-MM-DD HH:MM | ER=% | tweet_text`.
 
-**Data B** gives five‑number summaries; **Data C** content types; **Data D** hashtags; **Data E** best‑time.
+**Data B** gives five-number summaries; **Data C** content types; **Data D** hashtags; **Data E** best-time.
 
 ### Tasks
-1. Key Numeric Insights – highest ER, distance to median, tweet text+link, spread/outliers.  
-2. Content‑Type Performance – use Data C (give ER & views).  
-3. Keyword / Hashtag Trends – 3‑5 terms with higher ER (use Data D).  
-4. Best Times to Post – weekdays & 2‑hr windows (use Data E).
+1. Key Numeric Insights – highest ER, distance to median, tweet text+link, spread/outliers.
+2. Content-Type Performance – use Data C (give ER & views).
+3. Keyword / Hashtag Trends – 3-5 terms with higher ER (use Data D).
+4. Best Times to Post – weekdays & 2-hr windows (use Data E).
 
-**Rules**: bullet points ≤ 12 words; dates `YYYY‑MM‑DD`; don’t invent numbers.
+**Rules**: bullet points ≤ 12 words; dates `YYYY-MM-DD`; don’t invent numbers.
 
-### Data A
+### Data A
 {big_text}
 
-### Data B
+### Data B
 {five_num}
 
-### Data C
+### Data C
 {content_block}
 
-### Data D
+### Data D
 {hashtag_block}
 
-### Data E
+### Data E
 {day_time}
 "
 )
 
 overall_summary2 <- ask_gpt(prompt2, max_tokens = 1200)
 
-# 7 ── THEMES BY ENGAGEMENT TIER --------------------------------------------
-# 7 ── THEMES BY ENGAGEMENT TIER --------------------------------------------
+# 7 ── THEMES BY ENGAGEMENT TIER ────────────────────────────────────────────
 df_tier <- df |>
   mutate(
-    tier_num = dplyr::ntile(engagement_rate, 3),             # 1,2,3
-    tier     = factor(c("Low","Medium","High")[tier_num],
-                      levels = c("Low","Medium","High"))
+    tier_num = dplyr::ntile(engagement_rate, 3),
+    tier     = factor(c("Low","Medium","High")[tier_num], levels = c("Low","Medium","High"))
   )
 
 tidy_tokens <- bind_rows(
@@ -302,24 +314,18 @@ tier_keywords <- tidy_tokens |>
   summarise(keywords = glue_collapse(row, sep = "; "), .groups = "drop")
 
 prompt3 <- glue(
-  "You are a social‑media engagement analyst.\n\n",
+  "You are a social-media engagement analyst.\n\n",
   "### Keyword lists\n",
-  glue_collapse(sprintf("• %s tier → %s",
-                        tier_keywords$tier, tier_keywords$keywords), sep = "\n"),
+  glue_collapse(sprintf("• %s tier → %s", tier_keywords$tier, tier_keywords$keywords), sep = "\n"),
   "\n\n### Tasks\n",
-  "1. For each tier, name the *main theme(s)* in ≤ 100 words.\n",
+  "1. For each tier, name the *main theme(s)* in ≤ 100 words.\n",
   "2. Suggest one content strategy to move tweets from Low→Medium and Medium→High."
 )
 
 overall_summary3 <- ask_gpt(prompt3, temperature = 0.7, max_tokens = 500)
 
-# 8 ── MONTHLY ROUND‑UP ----------------------------------------------
-start_month <- lubridate::floor_date(Sys.Date(), "month")
-end_month   <- lubridate::ceiling_date(Sys.Date(), "month") - 1
-
+# 8 ── MONTHLY ROUND-UP ─────────────────────────────────────────────────────
 month_lines <- df |>
-  filter(publish_dt >= start_month,
-         publish_dt <= end_month) |>
   mutate(
     line = glue("{format(publish_dt, '%Y-%m-%d %H:%M')} | ",
                 "ER={round(engagement_rate,4)}% | ",
@@ -328,53 +334,42 @@ month_lines <- df |>
   pull(line)
 
 monthly_prompt <- glue(
-  "You are a social‑media analyst.\n\n",
-  "Each line in **Data M** is `YYYY-MM-DD HH:MM | ER | snippet | URL`.\n\n",
+  "You are a social-media analyst.\n\n",
+  "Each line in **Data M** is `YYYY-MM-DD HH:MM | ER | snippet | URL`.\n\n",
   "### Tasks\n",
   "1. What happened in {format(start_month, '%B %Y')}.\n",
   "2. The month ahead (announced launches, events).\n",
-  "• Bullet points ≤ 15 words; end each point with the URL.\n\n",
-  "### Data M\n",
+  "• Bullet points ≤ 15 words; end each point with the URL.\n\n",
+  "### Data M\n",
   glue_collapse(month_lines, sep = '\n')
 )
 
-overall_summary4 <- ask_gpt(monthly_prompt, temperature = 0.4, max_tokens = 450)
+overall_summary4 <- ask_gpt(monthly_prompt, temperature = 0.4, max_tokens = 600)
 
-
-# 9 ── LOCATE CHROME / CHROMIUM ---------------------------------------------
+# 9 ── CHROME ────────────────────────────────────────────────────────────────
 suppressMessages({
-  chrome <- pagedown::find_chrome()            %||%
-    Sys.which("chromium-browser")       %||%
-    Sys.which("google-chrome")          %||%
-    Sys.which("chromium")
-  if (chrome == "") stop("Cannot find Chrome/Chromium on the runner")
+  chrome <- Sys.getenv("CHROME_BIN")
+  if (chrome == "") chrome <- pagedown::find_chrome()
+  if (chrome == "" || !file.exists(chrome)) {
+    stop("Cannot find Chrome/Chromium – set CHROME_BIN or install a browser")
+  }
   options(pagedown.chromium = chrome)
 })
 
-# 10 ── COMBINE, WRITE, RENDER PDF ------------------------------------------
+# 10 ── RENDER PDF ───────────────────────────────────────────────────────────
 make_md_links <- function(txt) {
-  # 1️⃣ If GPT already wrote "[Link] https://…", merge them.
-  txt <- stringr::str_replace_all(
-    txt,
-    "\\[Link\\]\\s+(https?://\\S+)",
-    "<a href=\"\\1\">\\1</a>"
-  )
-
-  # 2️⃣ Convert any remaining bare URLs (not already inside () ) to anchors.
-  pattern <- "(?<!\\]\\()https?://\\S+"           # skip things already in []()
-  stringr::str_replace_all(
+  pattern <- "(?<!\\]\\()https?://\\S+"
+  str_replace_all(
     txt,
     pattern,
     function(m) sprintf("<a href=\"%s\">%s</a>", m, m)
   )
 }
 
-
-
 final_report <- glue(
   "{overall_summary}\n\n{overall_summary2}\n\n{overall_summary3}\n\n",
-  "## Monthly Round‑up\n\n{overall_summary4}"
-)|>
+  "## Monthly Round-up\n\n{overall_summary4}"
+) |>
   str_replace_all("\\$", "\\\\$") |>
   make_md_links()
 
@@ -385,34 +380,30 @@ writeLines(c(
   "",
   "# Monthly Summary",
   "",
-  final_report           # contains fully-formed <a href="…">…</a>
+  final_report
 ), "summary.md")
 
-# Markdown → HTML (no autolink)
 html_file <- tempfile(fileext = ".html")
-
 rmarkdown::pandoc_convert(
   "summary.md",
   to     = "html4",
-  from   = "markdown+tex_math_single_backslash",   # ← extension removed
+  from   = "markdown+tex_math_single_backslash",
   output = html_file,
   options = c("--standalone","--section-divs","--embed-resources",
               "--variable","bs3=TRUE","--variable","theme=bootstrap")
 )
 
-# HTML → PDF
 pagedown::chrome_print(
-  input   = html_file,          # use the HTML you just made
+  input   = html_file,
   output  = "summary_full.pdf",
   browser = chrome,
-  extra_args = "--no-sandbox"
+  extra_args = c("--headless","--disable-gpu","--no-sandbox")
 )
 
-
-# 11 ── UPLOAD TO SUPABASE ---------------------------------------------------
+# 11 ── UPLOAD TO SUPABASE ──────────────────────────────────────────────────
 object_path <- sprintf(
   "%s/summary_%s.pdf",
-  format(Sys.Date(), "%Y%m"),                 # e.g. “202507”
+  format(Sys.Date(), "%Y%m"),
   format(Sys.time(), "%Y-%m-%d_%H-%M-%S")
 )
 
@@ -434,7 +425,7 @@ request(upload_url) |>
 
 cat("✔ Uploaded to Supabase:", object_path, "\n")
 
-# 12 ── EMAIL VIA MAILJET ----------------------------------------------------
+# 12 ── EMAIL VIA MAILJET ───────────────────────────────────────────────────
 show_mj_error <- function(resp) {
   cat("\n↪ Mailjet response body:\n",
       resp_body_string(resp, encoding = "UTF-8"), "\n\n")
@@ -445,7 +436,6 @@ from_email <- if (str_detect(MAIL_FROM, "<.+@.+>")) {
 } else {
   MAIL_FROM
 }
-
 from_name  <- if (str_detect(MAIL_FROM, "<.+@.+>")) {
   str_trim(str_remove(MAIL_FROM, "<.+@.+>$"))
 } else {
@@ -465,7 +455,6 @@ mj_resp <- request("https://api.mailjet.com/v3.1/send") |>
         Filename      = sprintf("monthly_report_%s.pdf", format(start_month, "%Y%m")),
         Base64Content = base64enc::base64encode("summary_full.pdf")
       ))
-      
     ))
   )) |>
   req_error(is_error = \(x) FALSE) |>
@@ -475,7 +464,6 @@ if (resp_status(mj_resp) >= 300) {
   show_mj_error(mj_resp)
   stop(sprintf("Mailjet returned status %s", resp_status(mj_resp)))
 } else {
-  cat("📧  Mailjet response OK — report emailed\n")
+  cat("📧  Mailjet response OK — report emailed\n")
 }
-
 
