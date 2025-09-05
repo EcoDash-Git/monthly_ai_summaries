@@ -1,4 +1,3 @@
-# .github/workflows/monthly_twitter_report.yml
 name: Monthly Twitter Report
 
 on:
@@ -20,16 +19,19 @@ jobs:
       SUPABASE_PWD:          ${{ secrets.SUPABASE_PWD }}
       SUPABASE_URL:          ${{ secrets.SUPABASE_URL }}
       SUPABASE_SERVICE_ROLE: ${{ secrets.SUPABASE_SERVICE_ROLE }}
-      SB_BUCKET:             ${{ vars.SB_BUCKET }}   # e.g. monthly-reports
+      SB_BUCKET:             ${{ vars.SB_BUCKET || 'monthly-reports' }}
 
       # ---------- OpenAI ----------
       OPENAI_API_KEY:        ${{ secrets.OPENAI_API_KEY }}
 
-      # ---------- Mailjet ----------
+      # ---------- Mailjet (kept, but emailing is OFF unless SEND_EMAIL=true) ----------
       MJ_API_KEY:            ${{ secrets.MJ_API_KEY }}
       MJ_API_SECRET:         ${{ secrets.MJ_API_SECRET }}
       MAIL_FROM:             ${{ vars.MAIL_FROM }}
       MAIL_TO:               ${{ vars.MAIL_TO }}
+
+      # Turn email on/off
+      SEND_EMAIL:            "false"
 
       CI: true
       R_KEEP_PKG_SOURCE: no
@@ -58,14 +60,14 @@ jobs:
       - name: Export CHROME_BIN
         run: echo "CHROME_BIN=${{ steps.setup-chrome.outputs.chrome-path }}" >> $GITHUB_ENV
 
-      # Optional: also set CHROMOTE_CHROME (some setups look for this)
+      # Optional: also set CHROMOTE_CHROME
       - name: Export CHROMOTE_CHROME
         run: echo "CHROMOTE_CHROME=${{ steps.setup-chrome.outputs.chrome-path }}" >> $GITHUB_ENV
 
       - name: Install system libraries
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y \
+          sudo apt-get install -y --no-install-recommends \
             libcurl4-openssl-dev libssl-dev libxml2-dev \
             libfontconfig1 libharfbuzz-dev libfribidi-dev \
             libfreetype6-dev libpng-dev libtiff5-dev libjpeg-dev \
@@ -106,3 +108,4 @@ jobs:
             summary.md
             summary_full.pdf
           if-no-files-found: warn
+
