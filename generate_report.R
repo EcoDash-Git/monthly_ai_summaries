@@ -1,7 +1,7 @@
 #!/usr/bin/env Rscript
 # ---------------------------------------------------------------------------
 # generate_report.R – Monthly summary: render PDF, upload to Supabase,
-#                     and email via Mailjet
+#                     (OPTIONAL) email via Mailjet when SEND_EMAIL=true
 # ---------------------------------------------------------------------------
 
 # 0 ── PACKAGES ──────────────────────────────────────────────────────────────
@@ -9,13 +9,13 @@ required <- c(
   "tidyverse", "lubridate", "httr2", "httr", "jsonlite", "glue", "pagedown",
   "RPostgres", "DBI", "base64enc", "tidytext", "magrittr"
 )
-invisible(lapply(required, \(pkg) {
+invisible(lapply(required, function(pkg) {
   if (!requireNamespace(pkg, quietly = TRUE)) install.packages(pkg, quiet = TRUE)
   library(pkg, character.only = TRUE)
 }))
 
 # 1 ── HELPERS ───────────────────────────────────────────────────────────────
-trim_env <- \(var, default = "") {
+trim_env <- function(var, default = "") {
   val <- stringr::str_trim(Sys.getenv(var, unset = default))
   if (identical(val, "")) default else val
 }
@@ -57,7 +57,10 @@ ask_gpt <- function(prompt, model = "gpt-4o-mini",
 
 `%||%` <- function(a, b) if (nzchar(a)) a else b
 
-# 2 ── ENV VARS ──────────────────────────────────────────────────────────────
+# 2 ── EMAIL TOGGLE ──────────────────────────────────────────────────────────
+SEND_EMAIL <- tolower(Sys.getenv("SEND_EMAIL", "false")) %in% c("1","true","yes","on")
+
+# 3 ── ENV VARS ──────────────────────────────────────────────────────────────
 SB_HOST        <- trim_env("SUPABASE_HOST")
 SB_PORT        <- as.integer(trim_env("SUPABASE_PORT", "6543"))
 SB_DB          <- trim_env("SUPABASE_DB")
@@ -74,13 +77,19 @@ MJ_API_SECRET  <- trim_env("MJ_API_SECRET")
 MAIL_FROM      <- trim_env("MAIL_FROM")
 MAIL_TO        <- trim_env("MAIL_TO")
 
+# Required always (DB + storage + OpenAI)
 stopifnot(
-  SB_HOST  != "", OPENAI_KEY != "",
-  MJ_API_KEY != "", MJ_API_SECRET != "",
-  MAIL_FROM != "", MAIL_TO != ""
+  SB_HOST  != "", SB_PORT > 0, SB_DB != "", SB_USER != "", SB_PWD != "",
+  SB_URL   != "", SB_STORAGE_KEY != "",
+  OPENAI_KEY != ""
 )
 
-# 3 ── LOAD DATA ─────────────────────────────────────────────────────────────
+# Only require Mailjet creds if emailing is enabled
+if (SEND_EMAIL) {
+  stopifnot(MJ_API_KEY != "", MJ_API_SECRET != "", MAIL_FROM != "", MAIL_TO != "")
+}
+
+# 4 ── LOAD DATA ─────────────────────────────────────────────────────────────
 con <- DBI::dbConnect(
   RPostgres::Postgres(),
   host     = SB_HOST,
@@ -90,6 +99,8 @@ con <- DBI::dbConnect(
   password = SB_PWD,
   sslmode  = "require"
 )
+
+on.exit(DBI::dbDisconnect(con), add = TRUE)
 
 twitter_raw <- DBI::dbReadTable(con, "twitter_raw") |> as_tibble()
 
@@ -138,8 +149,7 @@ main_ids <- tibble::tribble(
   "EverVisionLabs",     "1742119960535789568"
 )
 
-
-# 4 ── PRE-PROCESS ───────────────────────────────────────────────────────────
+# 5 ── PRE-PROCESS ───────────────────────────────────────────────────────────
 start_month <- lubridate::floor_date(Sys.time(), "month")
 end_month   <- lubridate::ceiling_date(Sys.time(), "month")
 
@@ -159,11 +169,10 @@ tweets <- twitter_raw |>
   filter(publish_dt >= start_month, publish_dt < end_month) |>
   distinct(tweet_id, .keep_all = TRUE)
 
-# include quotes like the weekly version (change to "original" only if you prefer)
 df  <- tweets |> filter(tweet_type %in% c("original","quote"))
 df2 <- tweets
 
-# 5 ── SECTION 1 – ACTIVITY/LAUNCH SUMMARY ──────────────────────────────────
+# 6 ── SUMMARIES (unchanged logic) ──────────────────────────────────────────
 tweet_lines <- df |>
   mutate(
     line = glue(
@@ -201,12 +210,11 @@ clean_gpt_output <- function(txt) {
 
 launches_summary <- raw %>%
   clean_gpt_output() %>%
-  gsub("<(https?://[^>\\s]+)>", "\\1", ., perl = TRUE) %>%        # drop angle brackets
-  gsub("(?<!\\))\\s(https?://[^\\s)]+)\\s*$", " (\\1)", ., perl = TRUE)  # wrap bare URL once at EOL
+  gsub("<(https?://[^>\\s]+)>", "\\1", ., perl = TRUE) %>%
+  gsub("(?<!\\))\\s(https?://[^\\s)]+)\\s*$", " (\\1)", ., perl = TRUE)
 
 overall_summary <- launches_summary
 
-# 6 ── SECTION 2 – NUMERIC INSIGHTS / CONTENT TYPE / HASHTAGS ───────────────
 content_tbl <- df2 |>
   mutate(post_type = tweet_type |> str_to_title()) |>
   group_by(post_type) |>
@@ -240,7 +248,7 @@ hashtag_block <- df2 |>
 num_cols <- c("like_count","retweet_count","reply_count","view_count","engagement_rate")
 
 five_num <- df |>
-  summarise(across(all_of(num_cols), \(x){
+  summarise(across(all_of(num_cols), function(x){
     q <- quantile(x, c(0,.25,.5,.75,1), na.rm = TRUE)
     glue("min={q[1]}, q1={q[2]}, med={q[3]}, q3={q[4]}, max={q[5]}")
   })) |>
@@ -293,7 +301,6 @@ Each line in **Data A** has `YYYY-MM-DD HH:MM | ER=% | tweet_text`.
 
 overall_summary2 <- ask_gpt(prompt2, max_tokens = 1200)
 
-# 7 ── THEMES BY ENGAGEMENT TIER ────────────────────────────────────────────
 df_tier <- df |>
   mutate(
     tier_num = dplyr::ntile(engagement_rate, 3),
@@ -328,7 +335,6 @@ prompt3 <- glue(
 
 overall_summary3 <- ask_gpt(prompt3, temperature = 0.7, max_tokens = 500)
 
-# 8 ── MONTHLY ROUND-UP ─────────────────────────────────────────────────────
 month_lines <- df |>
   mutate(
     line = glue("{format(publish_dt, '%Y-%m-%d %H:%M')} | ",
@@ -350,7 +356,7 @@ monthly_prompt <- glue(
 
 overall_summary4 <- ask_gpt(monthly_prompt, temperature = 0.4, max_tokens = 600)
 
-# 9 ── CHROME ────────────────────────────────────────────────────────────────
+# 7 ── CHROME ────────────────────────────────────────────────────────────────
 suppressMessages({
   chrome <- Sys.getenv("CHROME_BIN")
   if (chrome == "") chrome <- pagedown::find_chrome()
@@ -360,7 +366,7 @@ suppressMessages({
   options(pagedown.chromium = chrome)
 })
 
-# 10 ── RENDER PDF ───────────────────────────────────────────────────────────
+# 8 ── RENDER PDF ────────────────────────────────────────────────────────────
 make_md_links <- function(txt) {
   pattern <- "(?<!\\]\\()https?://\\S+"
   str_replace_all(
@@ -404,7 +410,7 @@ pagedown::chrome_print(
   extra_args = c("--headless","--disable-gpu","--no-sandbox")
 )
 
-# 11 ── UPLOAD TO SUPABASE ──────────────────────────────────────────────────
+# 9 ── UPLOAD TO SUPABASE ───────────────────────────────────────────────────
 object_path <- sprintf(
   "%s/summary_%s.pdf",
   format(Sys.Date(), "%Y%m"),
@@ -429,46 +435,50 @@ request(upload_url) |>
 
 cat("✔ Uploaded to Supabase:", object_path, "\n")
 
-# 12 ── EMAIL VIA MAILJET ───────────────────────────────────────────────────
-show_mj_error <- function(resp) {
-  cat("\n↪ Mailjet response body:\n",
-      resp_body_string(resp, encoding = "UTF-8"), "\n\n")
-}
+# 10 ── EMAIL VIA MAILJET (optional) ────────────────────────────────────────
+if (SEND_EMAIL) {
+  show_mj_error <- function(resp) {
+    cat("\n↪ Mailjet response body:\n",
+        resp_body_string(resp, encoding = "UTF-8"), "\n\n")
+  }
 
-from_email <- if (str_detect(MAIL_FROM, "<.+@.+>")) {
-  str_remove_all(str_extract(MAIL_FROM, "<.+@.+>"), "[<>]")
-} else {
-  MAIL_FROM
-}
-from_name  <- if (str_detect(MAIL_FROM, "<.+@.+>")) {
-  str_trim(str_remove(MAIL_FROM, "<.+@.+>$"))
-} else {
-  "Report Bot"
-}
+  from_email <- if (str_detect(MAIL_FROM, "<.+@.+>")) {
+    str_remove_all(str_extract(MAIL_FROM, "<.+@.+>"), "[<>]")
+  } else {
+    MAIL_FROM
+  }
+  from_name  <- if (str_detect(MAIL_FROM, "<.+@.+>")) {
+    str_trim(str_remove(MAIL_FROM, "<.+@.+>$"))
+  } else {
+    "Report Bot"
+  }
 
-mj_resp <- request("https://api.mailjet.com/v3.1/send") |>
-  req_auth_basic(MJ_API_KEY, MJ_API_SECRET) |>
-  req_body_json(list(
-    Messages = list(list(
-      From      = list(Email = from_email, Name = from_name),
-      To        = list(list(Email = MAIL_TO)),
-      Subject   = sprintf("Monthly Twitter Report – %s", format(start_month, "%B %Y")),
-      TextPart  = "Attached you'll find the monthly report in PDF.",
-      Attachments = list(list(
-        ContentType   = "application/pdf",
-        Filename      = sprintf("monthly_report_%s.pdf", format(start_month, "%Y%m")),
-        Base64Content = base64enc::base64encode("summary_full.pdf")
+  mj_resp <- request("https://api.mailjet.com/v3.1/send") |>
+    req_auth_basic(MJ_API_KEY, MJ_API_SECRET) |>
+    req_body_json(list(
+      Messages = list(list(
+        From      = list(Email = from_email, Name = from_name),
+        To        = list(list(Email = MAIL_TO)),
+        Subject   = sprintf("Monthly Twitter Report – %s", format(start_month, "%B %Y")),
+        TextPart  = "Attached you'll find the monthly report in PDF.",
+        Attachments = list(list(
+          ContentType   = "application/pdf",
+          Filename      = sprintf("monthly_report_%s.pdf", format(start_month, "%Y%m")),
+          Base64Content = base64enc::base64encode("summary_full.pdf")
+        ))
       ))
-    ))
-  )) |>
-  req_error(is_error = \(x) FALSE) |>
-  req_perform()
+    )) |>
+    req_error(is_error = function(x) FALSE) |>
+    req_perform()
 
-if (resp_status(mj_resp) >= 300) {
-  show_mj_error(mj_resp)
-  stop(sprintf("Mailjet returned status %s", resp_status(mj_resp)))
+  if (resp_status(mj_resp) >= 300) {
+    show_mj_error(mj_resp)
+    stop(sprintf("Mailjet returned status %s", resp_status(mj_resp)))
+  } else {
+    cat("📧  Mailjet response OK — report emailed\n")
+  }
 } else {
-  cat("📧  Mailjet response OK — report emailed\n")
+  cat("↪ Skipping email step (SEND_EMAIL=false). Report generated & uploaded only.\n")
 }
 
 
